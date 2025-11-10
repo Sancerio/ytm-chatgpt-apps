@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { google } from "googleapis";
+import { createTokenStore } from "./tokenStore.js";
 
 dotenv.config();
 
@@ -30,6 +31,9 @@ const {
   AUTH_TOKEN_ENDPOINT,
   AUTH_REGISTRATION_ENDPOINT,
   AUTHORIZATION_SERVERS = "",
+  REDIS_REST_URL,
+  REDIS_REST_TOKEN,
+  REDIS_NAMESPACE = "ytm_tokens",
 } = process.env;
 
 if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
@@ -158,8 +162,30 @@ app.use(cors({
   },
 }));
 
-// In-memory token store (dev only). Replace with a DB for production.
-const tokenStore = new Map(); // key: userKey -> tokens
+const modulePath = fileURLToPath(import.meta.url);
+
+const redisRestUrl = REDIS_REST_URL
+  || process.env.UPSTASH_REDIS_REST_URL
+  || process.env.KV_REST_API_URL;
+const redisRestToken = REDIS_REST_TOKEN
+  || process.env.UPSTASH_REDIS_REST_TOKEN
+  || process.env.KV_REST_API_TOKEN;
+const redisReadOnlyToken = process.env.KV_REST_API_READ_ONLY_TOKEN;
+
+if (!redisRestToken && redisReadOnlyToken) {
+  console.warn("[token-store] KV_REST_API_READ_ONLY_TOKEN is set, but write access requires KV_REST_API_TOKEN.");
+}
+
+if (!redisRestUrl || !redisRestToken) {
+  throw new Error("Redis credentials are required. Provide REDIS_REST_URL/REDIS_REST_TOKEN, UPSTASH_REDIS_REST_URL/UPSTASH_REDIS_REST_TOKEN, or KV_REST_API_URL/KV_REST_API_TOKEN.");
+}
+
+const tokenStore = createTokenStore({
+  url: redisRestUrl,
+  token: redisRestToken,
+  namespace: REDIS_NAMESPACE,
+});
+console.log(`[token-store] driver=redis namespace=${REDIS_NAMESPACE}`);
 const stateStore = new Map(); // key: state -> userKey
 
 const oauth2Client = new google.auth.OAuth2(
@@ -173,9 +199,9 @@ function yt(tokens) {
   return google.youtube({ version: "v3", auth: oauth2Client });
 }
 
-function getTokensOrThrow(userKey) {
+async function getTokensOrThrow(userKey) {
   if (!userKey) throw new Error("Missing user key");
-  const tokens = tokenStore.get(userKey);
+  const tokens = await tokenStore.get(userKey);
   if (!tokens) {
     throw new Error(`Not authorized yet. Visit ${publicBase}/auth/start?userKey=${encodeURIComponent(userKey)} to connect your Google account.`);
   }
@@ -245,12 +271,12 @@ function requireUserKey(req, res) {
   return key;
 }
 
-function getTokensOr401(req, res) {
+async function getTokensOr401(req, res) {
   const userKey = req.authContext?.userKey || requireUserKey(req, res);
   if (!userKey) return [null, null];
-  const tokens = tokenStore.get(userKey);
+  const tokens = await tokenStore.get(userKey);
   if (!tokens) {
-    res.status(401).json({ error: `Not authorized with Google yet for this user. Visit /auth/start?userKey=${encodeURIComponent(userKey)} to connect.` });
+    res.status(401).json({ error: `Not authorized with Google yet for this user. Visit ${publicBase}/auth/start?userKey=${encodeURIComponent(userKey)} to connect.` });
     return [null, null];
   }
   return [userKey, tokens];
@@ -282,7 +308,7 @@ app.get("/oauth2/callback", async (req, res) => {
     if (!userKey) return res.status(400).send("Invalid state");
 
     const { tokens } = await oauth2Client.getToken(code);
-    tokenStore.set(userKey, tokens);
+    await tokenStore.set(userKey, tokens);
     stateStore.delete(state);
 
     res.send(`
@@ -302,7 +328,7 @@ app.get("/oauth2/callback", async (req, res) => {
 
 // ---- API: search videos (music-biased) ----
 app.get("/search", requireAuth(async (req, res) => {
-  const [userKey, tokens] = getTokensOr401(req, res);
+  const [userKey, tokens] = await getTokensOr401(req, res);
   if (!tokens) return;
   try {
     const q = req.query.q;
@@ -320,7 +346,7 @@ app.get("/search", requireAuth(async (req, res) => {
 
 // ---- API: create playlist ----
 app.post("/playlists", requireAuth(async (req, res) => {
-  const [userKey, tokens] = getTokensOr401(req, res);
+  const [userKey, tokens] = await getTokensOr401(req, res);
   if (!tokens) return;
   try {
     const { name, privacyStatus = "private", description = "" } = req.body || {};
@@ -336,7 +362,7 @@ app.post("/playlists", requireAuth(async (req, res) => {
 
 // ---- API: add items to playlist ----
 app.post("/playlists/:id/items", requireAuth(async (req, res) => {
-  const [userKey, tokens] = getTokensOr401(req, res);
+  const [userKey, tokens] = await getTokensOr401(req, res);
   if (!tokens) return;
   try {
     const id = req.params.id;
@@ -471,7 +497,7 @@ function createYouTubeMcpServer() {
   }, async ({ query, max }, extra) => {
     try {
       const userKey = resolveSessionUserKey(extra);
-      const tokens = getTokensOrThrow(userKey);
+      const tokens = await getTokensOrThrow(userKey);
       const items = await searchMusicVideos(tokens, { query, maxResults: clampMaxResults(max) });
       return {
         content: [{ type: "text", text: `Found ${items.length} tracks for "${query}"` }],
@@ -497,7 +523,7 @@ function createYouTubeMcpServer() {
   }, async ({ name, description = "", privacyStatus = "private" }, extra) => {
     try {
       const userKey = resolveSessionUserKey(extra);
-      const tokens = getTokensOrThrow(userKey);
+      const tokens = await getTokensOrThrow(userKey);
       const playlist = await createPlaylist(tokens, { name, description, privacyStatus });
       return {
         content: [{ type: "text", text: `Playlist ${name} created (${playlist.url})` }],
@@ -522,7 +548,7 @@ function createYouTubeMcpServer() {
   }, async ({ playlistId, videoIds }, extra) => {
     try {
       const userKey = resolveSessionUserKey(extra);
-      const tokens = getTokensOrThrow(userKey);
+      const tokens = await getTokensOrThrow(userKey);
       const result = await addPlaylistItems(tokens, playlistId, videoIds);
       return {
         content: [{ type: "text", text: `Added ${result.added} items to playlist ${playlistId}` }],
@@ -629,7 +655,6 @@ async function handleStreamableRequest(req, res) {
 app.get("/mcp", handleStreamableRequest);
 app.delete("/mcp", handleStreamableRequest);
 
-const modulePath = fileURLToPath(import.meta.url);
 const isDirectRun = process.argv[1] && resolve(process.argv[1]) === modulePath;
 
 if (isDirectRun) {

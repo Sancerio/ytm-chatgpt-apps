@@ -6,7 +6,7 @@ Open-source Node server that lets ChatGPT search YouTube, create playlists, and 
 - A [Model Context Protocol (MCP)](https://developers.openai.com/apps-sdk/build/mcp-server) transport at `/mcp`, so you can register it as a ChatGPT App Connector with zero extra glue code.
 
 ## Features
-- OAuth 2.0 dance for end users (stored in-memory per `userKey`).
+- OAuth 2.0 dance for end users (refresh tokens persisted per `userKey` in Redis via Upstash or your own cluster).
 - REST endpoints: `/search`, `/playlists`, `/playlists/:id/items`.
 - MCP tools mirroring those endpoints: `search_music_videos`, `create_playlist`, `add_videos_to_playlist`.
 - ngrok-friendly, HTTPS-only testing workflow with optional origin/host allowlists for DNS-rebinding protection.
@@ -34,6 +34,8 @@ npm start              # or: npm run dev (watch mode)
 | `MCP_ALLOWED_ORIGINS` | Origins allowed on MCP transport. Defaults to `https://chat.openai.com`; set empty while tunneling if the client omits `Origin`. |
 | `MCP_ALLOWED_HOSTS` | Optional host allowlist for MCP (use your ngrok hostname for extra protection). |
 | `PUBLIC_BASE_URL` | Public HTTPS origin (use your ngrok HTTPS URL during dev). Used to mint the OAuth metadata URL and resource identifier. |
+| `REDIS_REST_URL` / `REDIS_REST_TOKEN` | REST credentials for your Redis provider. Automatically falls back to `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` and Vercel KV’s `KV_REST_API_URL` / `KV_REST_API_TOKEN`. |
+| `REDIS_NAMESPACE` | Optional Redis key prefix (defaults to `ytm_tokens`). |
 | `AUTH_ISSUER` / `AUTH_AUDIENCE` | Values expected inside the ChatGPT-issued OAuth access token. Usually matches your IdP (Auth0/Okta/etc.). |
 | `AUTH_JWKS_URL` | JWKS endpoint for verifying bearer tokens. |
 | `AUTH_AUTHORIZATION_ENDPOINT` / `AUTH_TOKEN_ENDPOINT` / `AUTH_REGISTRATION_ENDPOINT` | Optional overrides so the `.well-known/oauth-protected-resource` response can reference your IdP endpoints. |
@@ -43,7 +45,7 @@ npm start              # or: npm run dev (watch mode)
 | `GOOGLE_REDIRECT_URI` | Usually `http://localhost:3000/oauth2/callback` in dev. |
 
 ## Authorize a Google account
-Each ChatGPT user must run the Google OAuth flow once so the server can store a refresh token keyed by the Auth0 `sub`. When a tool complains “Not authorized yet…”, have the user visit the provided link (e.g. `https://YOUR_DOMAIN/auth/start?userKey=google-oauth2%7C123…`) to finish the flow and return to ChatGPT. Tokens are cached in-memory per user; replace the store before shipping to prod.
+Each ChatGPT user must run the Google OAuth flow once so the server can store a refresh token keyed by the Auth0 `sub`. When a tool complains “Not authorized yet…”, have the user visit the provided link (e.g. `https://YOUR_DOMAIN/auth/start?userKey=google-oauth2%7C123…`) to finish the flow and return to ChatGPT. Tokens now live in Redis (Upstash REST works great locally and in Vercel), so they survive process restarts and redeploys automatically.
 
 > Dev escape hatch: if you leave `AUTH_ISSUER/AUDIENCE/JWKS_URL` empty, the server falls back to accepting `X-User-Key` headers so you can run curl tests without the IdP. Don’t rely on this mode in production.
 
@@ -119,22 +121,25 @@ Scripts:
 - `npm start` – run the server once
 - `npm run dev` – run with `node --watch` (beware file watch limits on macOS)
 
+## Token storage
+Provision a Redis database (Upstash or Vercel KV both work). If you enable Vercel KV, it auto-injects `KV_REST_API_URL` / `KV_REST_API_TOKEN`; locally you can either copy those exact names or map them to `REDIS_REST_URL` / `REDIS_REST_TOKEN`. Make sure you supply the write-capable token (not `KV_REST_API_READ_ONLY_TOKEN`). Optionally change `REDIS_NAMESPACE` if you share the cluster. Every OAuth refresh token is stored under `ytm_tokens:<userKey>` (or your namespace), so flushing that prefix disconnects users.
+
 ## Production notes
-- Replace the in-memory token store with encrypted storage.
+- Lock down Redis (separate databases/tokens per environment, optional network restrictions) because it stores long-lived YouTube refresh tokens.
 - Enforce HTTPS (ngrok/Cloudflare Tunnel are fine for dev, but deploy to a public host before sharing widely).
 - Set `ALLOWED_ORIGINS`, `MCP_ALLOWED_ORIGINS`, and `MCP_ALLOWED_HOSTS` to the exact values you expect in production to prevent DNS rebinding.
 
 ## Deploy to Vercel
 1. **Connect the repo.** Push this repo to GitHub/GitLab and create a new Vercel project that points at it. Vercel reads `vercel.json`, builds dependencies with `npm install`, and serves every route through `api/index.js`, which wraps the Express app with `serverless-http`.
-2. **Configure environment variables.** In Vercel → Project Settings → Environment Variables, add the same keys you use locally (`GOOGLE_CLIENT_ID/SECRET`, `AUTH_*`, etc.). Set `PUBLIC_BASE_URL` to your Vercel hostname (e.g. `https://ytm-chatgpt-apps.vercel.app`) and update `GOOGLE_REDIRECT_URI` to `https://<project>.vercel.app/oauth2/callback` so Google accepts the redirect.
-3. **Protect secrets.** Keep OAuth credentials and IdP metadata in Vercel’s encrypted config rather than committing them, aligning with the Apps SDK guidance to store secrets in your hosting platform and inject them at runtime.citeturn1view0
-4. **Deploy & verify.** Trigger a production deploy. Once live, hit `https://<project>.vercel.app/mcp` (HEAD + GET) and `/.well-known/oauth-protected-resource` to ensure the HTTPS endpoint streams correctly. The Apps SDK docs call out that whatever platform you choose must keep `/mcp` responsive, support streaming responses, and return proper HTTP codes, so test with MCP Inspector or curl before connecting ChatGPT.citeturn1view0
+2. **Configure environment variables.** In Vercel → Project Settings → Environment Variables, add the same keys you use locally (`GOOGLE_CLIENT_ID/SECRET`, `AUTH_*`, etc.). Set `PUBLIC_BASE_URL` to your Vercel hostname (e.g. `https://ytm-chatgpt-apps.vercel.app`), update `GOOGLE_REDIRECT_URI` to `https://<project>.vercel.app/oauth2/callback`, and either attach the Vercel KV integration (which injects `KV_REST_API_URL` / `KV_REST_API_TOKEN`) or paste your own `REDIS_REST_URL` / `REDIS_REST_TOKEN` values.
+3. **Protect secrets.** Keep OAuth credentials and IdP metadata in Vercel’s encrypted config rather than committing them, aligning with the Apps SDK guidance to store secrets in your hosting platform and inject them at runtime.
+4. **Deploy & verify.** Trigger a production deploy. Once live, hit `https://<project>.vercel.app/mcp` (HEAD + GET) and `/.well-known/oauth-protected-resource` to ensure the HTTPS endpoint streams correctly. The Apps SDK docs call out that whatever platform you choose must keep `/mcp` responsive, support streaming responses, and return proper HTTP codes, so test with MCP Inspector or curl before connecting ChatGPT.
 5. **Connect ChatGPT.** In ChatGPT (Developer mode), register the connector using the Vercel URL + `/mcp`, then rerun your golden prompts. Keep an eye on Vercel logs/metrics for latency spikes; if you need more headroom, adjust `maxDuration`/`memory` in `vercel.json`.
 
 Tip: during dogfooding, you can run `vercel env pull` to sync env vars locally and `vercel dev` to emulate rewrites before pushing changes.
 
 ## License
-Add your favorite SPDX license here before publishing (MIT is common for simple servers).
+This project is licensed under the MIT License.
 
 ## Contributing
 Issues and PRs are welcome! Please include:
